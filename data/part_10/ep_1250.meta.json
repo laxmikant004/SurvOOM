@@ -1,0 +1,18 @@
+{
+  "episode_id": "ep_1250",
+  "workload": "leak",
+  "headroom_pct": 160,
+  "limit_mb": 409,
+  "contention_n": 4,
+  "swap_mode": "off",
+  "memory_high_pct": 85,
+  "memory_high_set": "ok",
+  "target_container_id": "5261859292b5ccea2f035af4b307b3061154376d8efb251f97ae0f1f586aee82",
+  "docker_oom_killed_flag": "false",
+  "exit_code": "0",
+  "finished_at": "0001-01-01T00:00:00Z",
+  "dmesg_oom_lines": "",
+  "last_logs_tail": "Starting leaker. Rate: 2.0 MB/s, Duration: 300.0s, spike_ramp_s=3.0\n",
+  "psi_available": "yes",
+  "timeout_s": 300
+}

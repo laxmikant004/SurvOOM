@@ -1,0 +1,18 @@
+{
+  "episode_id": "ep_0579",
+  "workload": "redis_burst",
+  "headroom_pct": 130,
+  "limit_mb": 332,
+  "contention_n": 4,
+  "swap_mode": "off",
+  "memory_high_pct": 85,
+  "memory_high_set": "ok",
+  "target_container_id": "2b6e7b6805d86c0d00403771975d5bfa0301ee20f537987753a39d7fd39fd218",
+  "docker_oom_killed_flag": "true",
+  "exit_code": "137",
+  "finished_at": "2026-10-07T00:31:31.157882893Z",
+  "dmesg_oom_lines": "[Wed Oct  7 06:01:30 2026] Memory cgroup out of memory: Killed process 130060 (redis-server) total-vm:546340kB, anon-rss:337536kB, file-rss:7816kB, shmem-rss:0kB, UID:999 pgtables:896kB oom_score_adj:0\n",
+  "last_logs_tail": "1:C 07 Oct 2026 00:26:47.228 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.\n1:C 07 Oct 2026 00:26:47.229 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo\n1:C 07 Oct 2026 00:26:47.229 * Redis version=7.4.11, bits=64, commit=00000000, modified=0, pid=1, just started\n1:C 07 Oct 2026 00:26:47.229 * Configuration loaded\n1:M 07 Oct 2026 00:26:47.229 * Increased maximum number of open files to 10032 (it was originally set to 1024).\n1:M 07 Oct 2026 00:26:47.229 * monotonic clock: POSIX clock_gettime\n1:M 07 Oct 2026 00:26:47.231 * Running mode=standalone, port=6379.\n1:M 07 Oct 2026 00:26:47.231 * Server initialized\n1:M 07 Oct 2026 00:26:47.231 * Ready to accept connections tcp\n",
+  "psi_available": "yes",
+  "timeout_s": 300
+}

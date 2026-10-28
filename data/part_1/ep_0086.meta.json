@@ -1,0 +1,18 @@
+{
+  "episode_id": "ep_0086",
+  "workload": "allocstress",
+  "headroom_pct": 160,
+  "limit_mb": 409,
+  "contention_n": 1,
+  "swap_mode": "off",
+  "memory_high_pct": 85,
+  "memory_high_set": "ok",
+  "target_container_id": "37708c620f88c5b380f58c455d89dfec9499a4cc35c94b1a7d99c59d010cf349",
+  "docker_oom_killed_flag": "true",
+  "exit_code": "0",
+  "finished_at": "0001-01-01T00:00:00Z",
+  "dmesg_oom_lines": "[Fri Oct  2 02:51:21 2026] Memory cgroup out of memory: Killed process 103012 (stress-ng-vm) total-vm:479020kB, anon-rss:292kB, file-rss:920kB, shmem-rss:413716kB, UID:0 pgtables:924kB oom_score_adj:1000\n",
+  "last_logs_tail": "stress-ng: info:  [1] dispatching hogs: 1 vm\nstress-ng: info:  [1] cache allocate: default cache size: 24576K\n",
+  "psi_available": "yes",
+  "timeout_s": 300
+}

@@ -1,0 +1,18 @@
+{
+  "episode_id": "ep_0269",
+  "workload": "leak",
+  "headroom_pct": 100,
+  "limit_mb": 256,
+  "contention_n": 8,
+  "swap_mode": "off",
+  "memory_high_pct": 85,
+  "memory_high_set": "ok",
+  "target_container_id": "5a3f5436deba79b25a4c39bb3b9f702fd7481fe5b494f22bcc1af076708cf1b7",
+  "docker_oom_killed_flag": "true",
+  "exit_code": "137",
+  "finished_at": "2026-10-02T10:10:16.403618045Z",
+  "dmesg_oom_lines": "[Fri Oct  2 15:40:14 2026] Memory cgroup out of memory: Killed process 245021 (python3) total-vm:270564kB, anon-rss:261188kB, file-rss:5444kB, shmem-rss:0kB, UID:0 pgtables:572kB oom_score_adj:0\n",
+  "last_logs_tail": "Starting leaker. Rate: 2.0 MB/s, Duration: 300.0s, spike_ramp_s=3.0\n",
+  "psi_available": "yes",
+  "timeout_s": 300
+}
