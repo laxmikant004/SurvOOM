@@ -1,16 +1,10 @@
 """
 SurvOOM -- GRU survival model for proactive, per-container OOM-kill prediction.
 
-This is the paper's canonical model file. One architecture only: a GRU that
-reads a sliding LOOKBACK_WINDOW-row window of live cgroup/PSI metrics and
-outputs a risk score, trained with a Cox proportional-hazards (ranking)
-loss. (An earlier draft also had a "streaming" GRU that read a container's
-full history and emitted a risk score at every row. We decided not to use
-it for the paper -- the sliding-window model is simpler, matches how
-`realtime_csv_oom_predictor.py` already deploys, and the streaming variant
-added training cost without changing the paper's claims. It has been
-removed from this file; if you ever want it back, it lived in
-`gru_oom_predictor_only_csv_container_level_threshold_2.py` and `_3.py`.)
+Reference implementation for the paper. A GRU reads a sliding
+LOOKBACK_WINDOW-row window of live cgroup v2 / PSI metrics and outputs a
+risk score; it is trained with the Cox proportional-hazards partial
+likelihood (a ranking loss over time-to-event).
 
 Train + evaluate every tier on the normal train/validation/test split:
     python3 gru_oom_predictor.py
@@ -26,13 +20,12 @@ Hold out each workload in turn (produces one combined lowo_summary.csv):
     python3 gru_oom_predictor.py --holdout-workload all --tiers csv-only
 
 Alert on ONE container's CSV with an already-trained model bundle (the
-live / deployment path -- no meta.json, no retraining):
+deployment path: no meta.json, no retraining):
     python3 gru_oom_predictor.py predict --model-dir paper_run_<ts>/saved_models/csv-only --csv ep_123.csv
 
 What this file does, per feature tier:
   1. Trains the GRU (Cox-PH survival loss) with early stopping on the
-     validation Cox-PH loss, so the epoch count is chosen by the data,
-     not hand-tuned once and hard-coded.
+     validation Cox-PH loss.
   2. Per-CONTAINER (episode-level) yes/no accuracy: for each test
      container, "will it die" (ANY window crossed the alert threshold),
      compared against ground truth.
@@ -42,10 +35,10 @@ What this file does, per feature tier:
      alert level (CRITICAL / WARNING / OK), a calibrated probability of
      being OOM-killed, and a confidence level (High / Medium / Low). The
      probability comes from a Platt-scaling calibrator fitted on the
-     TRAIN containers' peak risk scores (never on test data).
+     VALIDATION containers' peak risk scores (never on test data).
   5. C-index (peak-risk + landmark at 60/120/180 s) + Kaplan-Meier.
-  6. A simple rule baseline: "alert when usage_ratio >= 0.99" (the
-     obvious non-ML alternative a reviewer will ask about).
+  6. A non-learned rule baseline: "alert when usage_ratio >=
+     BASELINE_USAGE_RATIO", scored on the same test containers.
   7. Early-alarm checks: share of alarms in the first window, lead time
      as a fraction of the episode, median first-alarm time.
 
@@ -58,24 +51,27 @@ stopping during training is also decided on the validation set, using a
 separate signal (Cox-PH loss, not peak risk) computed each epoch.
 
 Tiers (what the model is allowed to see):
-  full                 -- everything in the CSV plus meta.json fields.
-  csv-only             -- every live CSV signal; EXCLUDES meta.json fields
-                          (headroom_pct, contention_n) and memory_max (a
-                          per-container constant that leaks the
-                          experiment's headroom setting). THE DEPLOYABLE
-                          TIER -- this is what `predict` mode and
-                          `realtime_csv_oom_predictor.py` actually use.
-  no-distance          -- drops raw byte-magnitude columns (memory_current,
-                          memory_max, swap, anon/file/slab, usage_ratio).
+  (All tiers exclude t_wall, t_rel, events_oom and events_oom_kill.)
+  full                 -- every CSV column plus the meta.json fields
+                          headroom_pct and contention_n.
+  csv-only             -- every live CSV signal; excludes the meta.json
+                          fields and memory_max (a per-container constant
+                          that encodes the experiment's headroom setting).
+                          This is the deployable tier used by `predict`.
+  no-distance          -- drops the byte-magnitude columns (memory_current,
+                          memory_max, memory_swap_current, anon, file,
+                          kernel_stack, slab, usage_ratio).
   no-distance-strict   -- no-distance, and also no meta.json fields.
-  psi-only             -- only the four psi_* pressure-stall columns.
+  psi-only             -- only the psi_* pressure-stall columns (six memory
+                          PSI averages and psi_cpu_some_avg10).
 
 Cumulative cgroup counters (pgfault, pgmajfault, pgrefill,
 workingset_refault, events_low/high/max) are converted to per-second rates
-(USE_RATES=True) before scaling, so a counter's raw magnitude can't leak
-how long the container has already been running -- the model has to react
-to the current RATE of trouble, not to "this counter is large so the
-container must be old and close to the end of its episode".
+(USE_RATES=True) before scaling. Because these counters grow
+monotonically, their raw magnitude encodes elapsed time rather than current
+activity and would let the model infer time-to-death from episode age;
+rates describe what the container is doing now. All features are then
+standardised with a scaler fitted on the training containers only.
 
 Output, per tier, under <run_dir>/results/<tier>/:
   container_alerts.csv             -- ONE ROW PER CONTAINER: alert level, P(OOM-kill),
@@ -146,21 +142,15 @@ LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4              # L2 regularization; cheap insurance against overfitting
 GRAD_CLIP = 1.0                  # clip gradient norm every step, for training stability
 
-# Early stopping (replaces the old hard-coded EPOCHS=10 "verified by eye"
-# cutoff): train up to MAX_EPOCHS, but stop as soon as validation Cox-PH
-# loss hasn't improved by MIN_DELTA for PATIENCE epochs in a row, and keep
-# the weights from whichever epoch had the best validation loss -- not
-# whatever epoch training happened to stop on.
+# Early stopping: train up to MAX_EPOCHS, stop once the validation Cox-PH
+# loss has not improved by EARLY_STOP_MIN_DELTA for EARLY_STOP_PATIENCE
+# consecutive epochs, and keep the weights of the best validation epoch.
 MAX_EPOCHS = 60
 EARLY_STOP_PATIENCE = 5
 EARLY_STOP_MIN_DELTA = 1e-4
-# Batch size used ONLY for computing the per-epoch validation loss (early
-# stopping). Large enough that the Cox-PH ranking loss within one batch is
-# a stable estimate, small enough to fit a GRU forward pass on a modest
-# GPU -- a window is (LOOKBACK_WINDOW, num_features) floats, so a batch of
-# a few thousand windows is a few hundred MB even with cuDNN workspace,
-# nowhere near "the whole validation set in one GRU call" (which is what
-# the previous version did, and which asked a 6 GB GPU for ~38 GB).
+# Batch size used only for the per-epoch validation loss (early stopping):
+# large enough for a stable Cox-PH estimate within a batch, small enough to
+# fit a GRU forward pass on a modest GPU.
 VAL_EVAL_BATCH_SIZE = 1024
 
 SEED = 42
@@ -247,9 +237,10 @@ def prepare_df(csv_path, ep=None, use_rates=USE_RATES):
 # 2. Episode discovery
 # ==========================================
 def discover_episodes(data_dir):
-    """Find every ep_*.csv / ep_*.meta.json pair under data_dir, recursing
-    into subfolders (so a data/part_1 .. data/part_N layout works), and
-    read ground truth (did it actually get OOM-killed?) from the meta."""
+    """Find every ep_*.csv / ep_*.meta.json pair under data_dir (recursively)
+    and read the ground-truth outcome from the meta file. A container is
+    labelled OOM-killed if Docker's OOMKilled flag is set, or if it exited
+    with code 137 (SIGKILL) and has a real finish time."""
     meta_paths = glob.glob(os.path.join(data_dir, "**", "ep_*.meta.json"), recursive=True)
     meta_paths = [p for p in meta_paths if "smoke" not in p]
     episodes = []
@@ -291,11 +282,10 @@ def make_episode_split(episodes, test_frac=0.2, seed=SEED):
 
 
 def make_validation_split(episodes, train_ids, val_frac=VAL_FRAC, seed=SEED + 1):
-    """Carve a validation set out of the TRAIN containers, stratified the
-    same way (workload x died). The test set is untouched, so test results
-    stay comparable with earlier runs. Validation containers are never
-    trained on; they set the alert threshold, the confidence calibrator,
-    AND the early-stopping epoch."""
+    """Carve a validation set out of the training containers, stratified the
+    same way (workload x died); the test set is unchanged. Validation
+    containers are never trained on; they determine the alert threshold,
+    the confidence calibrator and the early-stopping epoch."""
     train_eps = [e for e in episodes if e["episode_id"] in train_ids]
     fit_ids, val_ids = make_episode_split(train_eps, test_frac=val_frac, seed=seed)
     return fit_ids, val_ids
@@ -316,10 +306,9 @@ def make_holdout_split(episodes, workload):
 class OOMSurvivalDataset(Dataset):
     """One item = one LOOKBACK_WINDOW-row sliding window from one episode,
     paired with (time remaining in the episode after this window, whether
-    the episode eventually died). Windows from the same episode share the
-    episode's scaler-fitted features; `episodes` holds one entry per
-    episode and `window_indices` maps a flat window index back to
-    (episode_idx, window_start_row)."""
+    the episode ended in an OOM kill). `episodes` holds each episode's
+    scaled feature matrix once; `window_indices` maps a flat window index
+    back to (episode_idx, window_start_row)."""
 
     def __init__(self, episodes, episode_ids, tier, scaler=None, lookback=LOOKBACK_WINDOW):
         self.lookback = lookback
@@ -337,9 +326,9 @@ class OOMSurvivalDataset(Dataset):
         print(f"[{tier}] Using {len(self.features_list)} features.")
 
         if scaler is None:
-            # Scaling statistics (mean / std per feature) from ALL training containers,
-            # one container at a time (partial_fit) so memory stays low. Validation and
-            # test reuse this scaler (else-branch), so no test data is ever used here.
+            # Per-feature mean / std from all training containers, accumulated one
+            # container at a time (partial_fit) to keep memory low. Validation and
+            # test reuse this scaler (else-branch), so no test data is used here.
             self.scaler = StandardScaler()
             n_fit = 0
             for ep in selected:
@@ -395,10 +384,9 @@ class OOMSurvivalDataset(Dataset):
 class GRUSurvival(nn.Module):
     """Reads one LOOKBACK_WINDOW-row window and outputs a single risk
     score from the GRU's final hidden state. Higher score = higher
-    predicted hazard of an OOM-kill. The score is NOT a probability -- it
-    is a Cox-PH ranking score, meaningful only relative to other windows'
-    scores (see ConfidenceCalibrator below for how we turn it into a
-    calibrated P(OOM-kill))."""
+    predicted hazard of an OOM kill. The score is a Cox-PH log relative
+    hazard, not a probability; ConfidenceCalibrator maps it to a
+    calibrated P(OOM-kill)."""
 
     def __init__(self, num_inputs, hidden_size=128, num_layers=2, dropout=0.2):
         super().__init__()
@@ -416,11 +404,10 @@ class GRUSurvival(nn.Module):
 # 5. Cox PH loss
 # ==========================================
 def cox_ph_loss(risk_scores, time, events):
-    """Cox partial-likelihood ranking loss: pushes risk scores to rank
-    windows correctly by time-to-event, among windows where the event
-    (OOM-kill) is actually observed (events==1). Windows from survived
-    episodes are censored observations -- they contribute to the ranking
-    denominator (as "still at risk") but never directly to the numerator."""
+    """Negative Cox partial log-likelihood (Breslow, within a mini-batch).
+    Windows from OOM-killed episodes (events == 1) contribute event terms;
+    windows from surviving episodes are right-censored and appear only in
+    the risk sets of the denominator."""
     time, events, risk_scores = time.view(-1), events.view(-1), risk_scores.view(-1)
     idx = torch.argsort(time, descending=True)
     time_sorted, events_sorted, risk_scores_sorted = time[idx], events[idx], risk_scores[idx]
@@ -476,10 +463,7 @@ def train_model(tier, episodes, train_ids, val_ids, test_ids, run_dir):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    # Fixed, GPU-memory-safe batch size for validation loss (see
-    # VAL_EVAL_BATCH_SIZE above). The reported val_loss is the mean over
-    # these batches -- a stable-enough signal for early stopping without
-    # trying to run the whole validation set through the GRU in one call.
+    # Validation loss = mean Cox-PH loss over batches of VAL_EVAL_BATCH_SIZE.
     val_loader = DataLoader(val_dataset, batch_size=VAL_EVAL_BATCH_SIZE, shuffle=False)
 
     model = GRUSurvival(num_inputs=len(train_dataset.features_list), hidden_size=128, num_layers=2).to(device)
@@ -527,9 +511,8 @@ def train_model(tier, episodes, train_ids, val_ids, test_ids, run_dir):
 
 
 def _save_training_curve(history, best_epoch, model_dir, tier):
-    """CSV + PNG of train/val Cox-PH loss per epoch, with the chosen
-    (early-stopped) epoch marked -- useful evidence for the paper that
-    training actually converged rather than being cut off arbitrarily."""
+    """CSV + PNG of train/validation Cox-PH loss per epoch, with the selected
+    (early-stopped) epoch marked."""
     df = pd.DataFrame(history)
     df.to_csv(os.path.join(model_dir, "training_curve.csv"), index=False)
     plt.figure(figsize=(7, 4.5))
@@ -560,10 +543,14 @@ def pick_container_threshold(peak_risk, died, mode=THRESHOLD_MODE, min_precision
     """Alert threshold chosen per CONTAINER, on validation containers.
 
     A container alarms iff some window's risk >= threshold, i.e. iff its
-    PEAK risk >= threshold -- so choosing the threshold on peak risks
-    optimises exactly the decision we report. (An earlier version chose it
-    on individual windows: with ~1,000 windows per container, one noisy
-    window was enough to flag a survivor.)
+    PEAK risk >= threshold, so choosing the threshold on peak risks
+    optimises exactly the per-container decision that is reported. (A
+    window-level threshold would ignore that a container has hundreds of
+    windows, any one of which can trigger an alarm.)
+
+    mode="precision": lowest threshold with validation precision >=
+    min_precision (i.e. maximum recall at that precision); falls back to
+    the best-F1 threshold if none reaches it. mode="f1": best F1.
 
     Returns (threshold, rule_used)."""
     if len(np.unique(died)) < 2:
@@ -592,16 +579,15 @@ def container_peak_risk(dataset, window_risk):
 
 class ConfidenceCalibrator:
     """Platt scaling: maps a container's peak risk score to a calibrated
-    probability P(OOM-kill). Fitted on TRAIN containers only. A model
-    score of 2.3 means nothing to an operator; "87% chance of OOM-kill"
-    does."""
+    probability P(OOM-kill) with a one-feature logistic regression.
+    Fitted on the VALIDATION containers only (never on test data)."""
 
     def __init__(self, coef=None, intercept=None, constant_p=None):
         self.coef, self.intercept, self.constant_p = coef, intercept, constant_p
 
     @classmethod
     def fit(cls, peak_risk, died):
-        if len(np.unique(died)) < 2:      # degenerate: only one class in train
+        if len(np.unique(died)) < 2:      # degenerate: only one class present
             return cls(constant_p=float(np.mean(died)))
         lr = LogisticRegression(C=1.0).fit(peak_risk.reshape(-1, 1), died)
         return cls(coef=float(lr.coef_[0][0]), intercept=float(lr.intercept_[0]))
@@ -666,12 +652,11 @@ def summarize_predictions(df):
 
 
 def early_alarm_stats(df):
-    """How 'early' are the caught deaths really? Computed over true
-    positives only.
-      - alarm_at_first_window_frac: share of alarms that fired at the very
-        first moment the method could speak. A high value means the method
-        recognised "this run will die" from its start, rather than detecting
-        trouble building up -- and lead time then mostly reflects episode
+    """Timing of the alarms on caught deaths (true positives only).
+      - alarm_at_first_window_frac: share of alarms raised at the first
+        moment the method could output a decision. A high value would mean
+        the outcome is recognised from the start of the episode rather than
+        from trouble building up, so lead time would mostly reflect episode
         length.
       - lead_fraction_median: lead time / episode duration. ~1.0 means
         "alarm at the start", small values mean "alarm near the end".
@@ -688,7 +673,7 @@ def early_alarm_stats(df):
 
 
 # ==========================================
-# 8. Episode-level (per-container) analysis -- THE reported result
+# 8. Episode-level (per-container) analysis -- primary evaluation
 # ==========================================
 def episode_level_analysis(test_dataset, test_risk, threshold, calibrator, plot_dir):
     """Per-container yes/no, lead time, alert level and calibrated
@@ -774,7 +759,7 @@ def episode_level_analysis(test_dataset, test_risk, threshold, calibrator, plot_
     for msg in alerts_df.alert_message.head(5):
         print(f"    {msg}")
 
-    # How reliable is each confidence level? (key table for the paper)
+    # Accuracy within each confidence level
     conf_rows = []
     for cl in ["High", "Medium", "Low"]:
         g = df[df.confidence_level == cl]
@@ -945,7 +930,7 @@ def episode_level_analysis(test_dataset, test_risk, threshold, calibrator, plot_
         "episode_lead_time_median_s": lt_median, "episode_lead_time_p25_s": lt_p25,
         "episode_lead_time_p75_s": lt_p75, "n_died_episodes": n_died, "never_alerted": never_alerted,
         "container_roc_auc": container_roc_auc, "brier_score": brier, **early,
-        "_lead_times_raw": lead_times.tolist(),  # internal: used by plot_tier_comparison's boxplot
+        "_lead_times_raw": lead_times.tolist(),  # used by plot_tier_comparison's boxplot
     }
 
 
@@ -975,21 +960,21 @@ def _safe_cindex(times, risk, events):
 
 
 def container_level_survival_plot(test_dataset, test_risk, plot_dir):
-    """Three C-index variants, because the plain "first window only" one
-    is misleading: early on, PSI is ~0 for every container, so psi-only
-    gets exactly 0.5 from ties, while usage-based tiers score high just
-    from where usage started.
+    """Container-level concordance (C-index), in three variants:
 
-      c_index            -- peak risk over the whole episode vs. time to
-                            death. Matches the alert rule. Uses windows up
-                            to the end, so it is optimistic.
-      c_index_at_<L>s    -- LANDMARK C-index (the honest, prospective one):
-                            only containers still running at L seconds,
-                            risk = highest score seen up to L, ranked
-                            against the time remaining after L.
-      c_index_first_window -- the old metric, kept for transparency.
+      c_index              -- peak risk over the whole episode vs. time to
+                              the end of the episode. Matches the alert rule,
+                              but uses windows up to the end, so it is
+                              optimistic.
+      c_index_at_<L>s      -- landmark C-index (prospective): only containers
+                              still running at L seconds; risk = highest score
+                              seen up to L, ranked against the time remaining
+                              after L.
+      c_index_first_window -- risk of the first window only. Reported for
+                              completeness; early in an episode PSI is ~0 for
+                              every container, so PSI-only scores tie (0.5).
     Kaplan-Meier groups use the first landmark (risk known at L s, survival
-    after L s), so the plot doesn't peek at the end of the episode either."""
+    after L s), so no information from after L is used."""
     if not HAVE_LIFELINES:
         print("[!] lifelines not installed — skipping C-index and Kaplan-Meier plot.")
         return {}
@@ -1055,12 +1040,12 @@ def container_level_survival_plot(test_dataset, test_risk, plot_dir):
 
 
 # ==========================================
-# 10. Rule baseline: alert when usage_ratio >= 0.99
+# 10. Rule baseline: alert when usage_ratio >= BASELINE_USAGE_RATIO
 # ==========================================
 def usage_threshold_baseline(test_episode_ids, episodes, run_dir, ratio=BASELINE_USAGE_RATIO):
-    """The obvious non-ML alternative a reviewer will ask about. Evaluated on
-    exactly the same test containers as the GRU (the ones its test set kept),
-    with the same container-level rules. It has no confidence score."""
+    """Non-learned reference: alert when usage_ratio >= ratio. Evaluated on
+    exactly the same test containers as the GRU, with the same
+    container-level scoring. It produces no risk or confidence score."""
     tier = f"baseline-usage{int(round(ratio * 100))}"
     plot_dir = os.path.join(run_dir, 'results', tier)
     os.makedirs(plot_dir, exist_ok=True)
@@ -1118,8 +1103,8 @@ def evaluate_and_plot(model, train_dataset, val_dataset, test_dataset, device, t
     os.makedirs(plot_dir, exist_ok=True)
     summary = {"tier": tier}
 
-    # Alert threshold + confidence calibrator: VALIDATION containers only
-    # (held out from training, never seen by the model; test is untouched)
+    # Alert threshold + confidence calibrator: validation containers only
+    # (never trained on); the test set is not used here
     val_risk = score_all_windows(model, val_dataset, device)
     val_peak, val_died = container_peak_risk(val_dataset, val_risk)
     threshold, rule = pick_container_threshold(val_peak, val_died)
@@ -1280,9 +1265,8 @@ def predict_container(model_dir, csv_path):
 # ==========================================
 def run_training(holdout=None, tiers=None, run_dir=None):
     tiers = tiers or TIERS
-    # Every run gets its own folder, so nothing from a previous run is
-    # ever overwritten: saved_datasets/, saved_models/, and results/
-    # all live underneath this one run_dir.
+    # Each run writes to its own timestamped folder (saved_datasets/,
+    # saved_models/, results/), so earlier runs are never overwritten.
     if run_dir is None:
         run_dir = f"paper_run_{datetime.now():%Y%m%d_%H%M%S}" + (f"_holdout-{holdout}" if holdout else "")
     os.makedirs(run_dir, exist_ok=True)
@@ -1299,8 +1283,8 @@ def run_training(holdout=None, tiers=None, run_dir=None):
         print(f"UNSEEN-WORKLOAD TEST: training on {sorted({e['workload'] for e in episodes} - {holdout})}; "
               f"testing on all {len(test_ids)} '{holdout}' containers ({n_died} died, {len(test_ids) - n_died} survived).")
     else:
-        train_ids, test_ids = make_episode_split(episodes)              # same test set as earlier runs
-    fit_ids, val_ids = make_validation_split(episodes, train_ids)   # validation carved from train
+        train_ids, test_ids = make_episode_split(episodes)              # stratified, seeded test split
+    fit_ids, val_ids = make_validation_split(episodes, train_ids)   # validation carved from training
     print(f"Episode-level split: {len(fit_ids)} train, {len(val_ids)} validation, {len(test_ids)} test.")
 
     all_summaries = []
